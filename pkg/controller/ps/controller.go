@@ -49,6 +49,7 @@ import (
 	"github.com/percona/percona-server-mysql-operator/pkg/innodbcluster"
 	"github.com/percona/percona-server-mysql-operator/pkg/k8s"
 	"github.com/percona/percona-server-mysql-operator/pkg/mysql"
+	"github.com/percona/percona-server-mysql-operator/pkg/mysql/topology"
 	"github.com/percona/percona-server-mysql-operator/pkg/mysqlsh"
 	"github.com/percona/percona-server-mysql-operator/pkg/orchestrator"
 	"github.com/percona/percona-server-mysql-operator/pkg/platform"
@@ -759,18 +760,18 @@ func (r *PerconaServerMySQLReconciler) reconcileReplication(ctx context.Context,
 		return errors.Wrap(err, "reconcile group replication")
 	}
 
-	if cr.Spec.MySQL.ClusterType == apiv1alpha1.ClusterTypeGR || !cr.OrchestratorEnabled() || cr.Spec.Orchestrator.Size <= 0 {
+	if cr.Spec.MySQL.ClusterType == apiv1alpha1.ClusterTypeGR {
 		return nil
 	}
 
 	sts := &appsv1.StatefulSet{}
 	// no need to set init image since we're just getting obj from API
-	if err := r.Get(ctx, client.ObjectKeyFromObject(orchestrator.StatefulSet(cr, "")), sts); err != nil {
+	if err := r.Get(ctx, client.ObjectKeyFromObject(mysql.StatefulSet(cr, "", "", new(corev1.Secret))), sts); err != nil {
 		return client.IgnoreNotFound(err)
 	}
 
 	if sts.Status.ReadyReplicas == 0 {
-		log.Info("orchestrator is not ready. skip", "ready", sts.Status.ReadyReplicas)
+		log.Info("mysql is not ready. skip", "ready", sts.Status.ReadyReplicas)
 		return nil
 	}
 
@@ -797,6 +798,10 @@ func (r *PerconaServerMySQLReconciler) reconcileReplication(ctx context.Context,
 
 	if err := reconcileReplicationSemiSync(ctx, r.Client, cr); err != nil {
 		return errors.Wrapf(err, "reconcile %s", cr.MySQLSpec().ClusterType)
+	}
+
+	if err := r.reconcileLabels(ctx, cr); err != nil {
+		return errors.Wrap(err, "failed to reconcile labels")
 	}
 
 	return nil
@@ -858,18 +863,17 @@ func reconcileReplicationSemiSync(
 ) error {
 	log := logf.FromContext(ctx).WithName("reconcileReplicationSemiSync")
 
-	primary, err := getPrimaryFromOrchestrator(ctx, cr)
-	if err != nil {
-		return errors.Wrap(err, "get primary")
-	}
-	primaryHost := primary.Key.Hostname
-
-	log.V(1).Info("Use primary host", "primaryHost", primaryHost, "clusterPrimary", primary)
-
 	operatorPass, err := k8s.UserPassword(ctx, cl, cr, apiv1alpha1.UserOperator)
 	if err != nil {
 		return errors.Wrap(err, "get operator password")
 	}
+	t, err := topology.Get(ctx, cr, operatorPass)
+	if err != nil {
+		return errors.Wrap(err, "discover topology")
+	}
+
+	primaryHost := t.Primary
+	log.V(1).Info("Use primary host", "primaryHost", primaryHost)
 
 	db, err := replicator.NewReplicator(apiv1alpha1.UserOperator,
 		operatorPass,
@@ -889,6 +893,47 @@ func reconcileReplicationSemiSync(
 		return errors.Wrapf(err, "set semi-sync size on %s", primaryHost)
 	}
 	log.V(1).Info("Set semi-sync size", "host", primaryHost)
+
+	return nil
+}
+
+func (r *PerconaServerMySQLReconciler) reconcileLabels(ctx context.Context, cr *apiv1alpha1.PerconaServerMySQL) error {
+	log := logf.FromContext(ctx).WithName("reconcileLabels")
+	pods, err := k8s.PodsByLabels(ctx, r.Client, mysql.MatchLabels(cr))
+	if err != nil {
+		return errors.Wrap(err, "get pods")
+	}
+	if len(pods) == 0 {
+		return nil
+	}
+	operatorPass, err := k8s.UserPassword(ctx, r.Client, cr, apiv1alpha1.UserOperator)
+	if err != nil {
+		return errors.Wrap(err, "get operator password")
+	}
+	t, err := topology.Get(ctx, cr, operatorPass)
+	if err != nil {
+		return errors.Wrap(err, "get topology")
+	}
+	for i := range pods {
+		pod := pods[i].DeepCopy()
+
+		fqdn := fmt.Sprintf("%s.%s.%s", pod.Name, mysql.Name(cr), cr.Namespace)
+		_, ok := pod.Labels[apiv1alpha1.MySQLPrimaryLabel]
+		if ok && !t.IsPrimary(fqdn) {
+			log.Info("Remove primary label", "fqdn", fqdn)
+			k8s.RemoveLabel(pod, apiv1alpha1.MySQLPrimaryLabel)
+			if err := r.Patch(ctx, pod, client.StrategicMergeFrom(&pods[i])); err != nil {
+				return errors.Wrapf(err, "remove label from old primary pod: %v/%v", pod.GetNamespace(), pod.GetName())
+			}
+		}
+		if !ok && t.IsPrimary(fqdn) {
+			log.Info("Add primary label", "fqdn", fqdn)
+			k8s.AddLabel(pod, apiv1alpha1.MySQLPrimaryLabel, "true")
+			if err := r.Patch(ctx, pod, client.StrategicMergeFrom(&pods[i])); err != nil {
+				return errors.Wrapf(err, "remove label from old primary pod: %v/%v", pod.GetNamespace(), pod.GetName())
+			}
+		}
+	}
 
 	return nil
 }
@@ -1302,66 +1347,20 @@ func writeStatus(
 	})
 }
 
-func getPrimaryFromOrchestrator(ctx context.Context, cr *apiv1alpha1.PerconaServerMySQL) (*orchestrator.Instance, error) {
-	orcHost := orchestrator.APIHost(cr)
-	primary, err := orchestrator.ClusterPrimary(ctx, orcHost, cr.ClusterHint())
-	if err != nil {
-		return nil, errors.Wrap(err, "get cluster primary")
-	}
-
-	if primary.Key.Hostname == "" {
-		primary.Key.Hostname = fmt.Sprintf("%s.%s.%s", primary.Alias, mysql.ServiceName(cr), cr.Namespace)
-	}
-
-	return primary, nil
-}
-
-func (r *PerconaServerMySQLReconciler) getPrimaryFromGR(ctx context.Context, cr *apiv1alpha1.PerconaServerMySQL) (string, error) {
-	operatorPass, err := k8s.UserPassword(ctx, r.Client, cr, apiv1alpha1.UserOperator)
-	if err != nil {
-		return "", errors.Wrap(err, "get operator password")
-	}
-
-	fqdn := mysql.FQDN(cr, 0)
-	db, err := replicator.NewReplicator(apiv1alpha1.UserOperator, operatorPass, fqdn, mysql.DefaultAdminPort)
-	if err != nil {
-		return "", errors.Wrapf(err, "open connection to %s", fqdn)
-	}
-
-	return db.GetGroupReplicationPrimary()
-}
-
-func (r *PerconaServerMySQLReconciler) getPrimaryHost(ctx context.Context, cr *apiv1alpha1.PerconaServerMySQL) (string, error) {
-	log := logf.FromContext(ctx).WithName("getPrimaryHost")
-
-	if cr.Spec.MySQL.IsGR() {
-		return r.getPrimaryFromGR(ctx, cr)
-	}
-
-	primary, err := getPrimaryFromOrchestrator(ctx, cr)
-	if err != nil {
-		return "", errors.Wrap(err, "get cluster primary")
-	}
-	log.V(1).Info("Cluster primary from orchestrator", "primary", primary)
-
-	return primary.Key.Hostname, nil
-}
-
 func (r *PerconaServerMySQLReconciler) stopAsyncReplication(ctx context.Context, cr *apiv1alpha1.PerconaServerMySQL) error {
 	log := logf.FromContext(ctx).WithName("stopAsyncReplication")
 
 	orcHost := orchestrator.APIHost(cr)
-	primary, err := getPrimaryFromOrchestrator(ctx, cr)
-	if err != nil {
-		return errors.Wrap(err, "get cluster primary")
-	}
-
 	operatorPass, err := k8s.UserPassword(ctx, r.Client, cr, apiv1alpha1.UserOperator)
 	if err != nil {
 		return errors.Wrap(err, "get operator password")
 	}
+	topology, err := topology.Get(ctx, cr, operatorPass)
+	if err != nil {
+		return errors.Wrap(err, "failed to get topology")
+	}
 
-	db, err := replicator.NewReplicator(apiv1alpha1.UserOperator, operatorPass, primary.Key.Hostname, mysql.DefaultAdminPort)
+	db, err := replicator.NewReplicator(apiv1alpha1.UserOperator, operatorPass, topology.Primary, mysql.DefaultAdminPort)
 	if err != nil {
 		return errors.Wrap(err, "open connection to primary")
 	}
@@ -1372,16 +1371,15 @@ func (r *PerconaServerMySQLReconciler) stopAsyncReplication(ctx context.Context,
 	}
 
 	g, gCtx := errgroup.WithContext(context.Background())
-	for _, replica := range primary.Replicas {
-		hostname := replica.Hostname
-		port := replica.Port
+	for _, replica := range topology.Replicas {
+		hostname := replica
 		g.Go(func() error {
-			repDb, err := replicator.NewReplicator(apiv1alpha1.UserOperator, operatorPass, hostname, port)
+			repDb, err := replicator.NewReplicator(apiv1alpha1.UserOperator, operatorPass, hostname, mysql.DefaultPort)
 			if err != nil {
 				return errors.Wrapf(err, "connect to replica %s", hostname)
 			}
 
-			if err := orchestrator.StopReplication(gCtx, orcHost, hostname, port); err != nil {
+			if err := orchestrator.StopReplication(gCtx, orcHost, hostname, mysql.DefaultPort); err != nil {
 				return errors.Wrapf(err, "stop replica %s", hostname)
 			}
 
@@ -1398,7 +1396,7 @@ func (r *PerconaServerMySQLReconciler) stopAsyncReplication(ctx context.Context,
 				}
 			}
 
-			log.V(1).Info("Stopped replication on replica", "hostname", hostname, "port", port)
+			log.V(1).Info("Stopped replication on replica", "hostname", hostname, "port", mysql.DefaultPort)
 
 			return nil
 		})
@@ -1411,20 +1409,19 @@ func (r *PerconaServerMySQLReconciler) startAsyncReplication(ctx context.Context
 	log := logf.FromContext(ctx).WithName("startAsyncReplication")
 
 	orcHost := orchestrator.APIHost(cr)
-	primary, err := getPrimaryFromOrchestrator(ctx, cr)
-	if err != nil {
-		return errors.Wrap(err, "get cluster primary")
-	}
-
 	operatorPass, err := k8s.UserPassword(ctx, r.Client, cr, apiv1alpha1.UserOperator)
 	if err != nil {
 		return errors.Wrap(err, "get operator password")
 	}
 
+	topology, err := topology.Get(ctx, cr, operatorPass)
+	if err != nil {
+		return errors.Wrap(err, "get cluster topology")
+	}
+
 	g, gCtx := errgroup.WithContext(context.Background())
-	for _, replica := range primary.Replicas {
-		hostname := replica.Hostname
-		port := replica.Port
+	for _, replica := range topology.Replicas {
+		hostname := replica
 		g.Go(func() error {
 			db, err := replicator.NewReplicator(
 				apiv1alpha1.UserOperator,
@@ -1437,16 +1434,16 @@ func (r *PerconaServerMySQLReconciler) startAsyncReplication(ctx context.Context
 			}
 			defer db.Close()
 
-			log.V(1).Info("Change replication source", "primary", primary.Key.Hostname, "replica", hostname)
-			if err := db.ChangeReplicationSource(primary.Key.Hostname, replicaPass, primary.Key.Port); err != nil {
+			log.V(1).Info("Change replication source", "primary", topology.Primary, "replica", hostname)
+			if err := db.ChangeReplicationSource(topology.Primary, replicaPass, mysql.DefaultPort); err != nil {
 				return errors.Wrapf(err, "change replication source on %s", hostname)
 			}
 
-			if err := orchestrator.StartReplication(gCtx, orcHost, hostname, port); err != nil {
+			if err := orchestrator.StartReplication(gCtx, orcHost, hostname, mysql.DefaultPort); err != nil {
 				return errors.Wrapf(err, "start replication on %s", hostname)
 			}
 
-			log.V(1).Info("Started replication on replica", "hostname", hostname, "port", port)
+			log.V(1).Info("Started replication on replica", "hostname", hostname, "port", mysql.DefaultPort)
 
 			return nil
 		})
