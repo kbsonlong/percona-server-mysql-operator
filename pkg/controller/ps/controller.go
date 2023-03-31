@@ -775,27 +775,6 @@ func (r *PerconaServerMySQLReconciler) reconcileReplication(ctx context.Context,
 		return nil
 	}
 
-	if err := orchestrator.Discover(ctx, orchestrator.APIHost(cr), mysql.ServiceName(cr), mysql.DefaultPort); err != nil {
-		switch err.Error() {
-		case "Unauthorized":
-			log.Info("mysql is not ready, unauthorized orchestrator discover response. skip")
-			return nil
-		case orchestrator.ErrEmptyResponse.Error():
-			log.Info("mysql is not ready, empty orchestrator discover response. skip")
-			return nil
-		}
-		return errors.Wrap(err, "failed to discover cluster")
-	}
-
-	primary, err := orchestrator.ClusterPrimary(ctx, orchestrator.APIHost(cr), cr.ClusterHint())
-	if err != nil {
-		return errors.Wrap(err, "get cluster primary")
-	}
-	if primary.Alias == "" {
-		log.Info("mysql is not ready, orchestrator cluster primary alias is empty. skip")
-		return nil
-	}
-
 	if err := reconcileReplicationSemiSync(ctx, r.Client, cr); err != nil {
 		return errors.Wrapf(err, "reconcile %s", cr.MySQLSpec().ClusterType)
 	}
