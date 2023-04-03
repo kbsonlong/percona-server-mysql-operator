@@ -850,6 +850,10 @@ func reconcileReplicationSemiSync(
 	if err != nil {
 		return errors.Wrap(err, "discover topology")
 	}
+	if t.Primary == "" {
+		log.V(1).Info("MySQL not ready. skip")
+		return nil
+	}
 
 	primaryHost := t.Primary
 	log.V(1).Info("Use primary host", "primaryHost", primaryHost)
