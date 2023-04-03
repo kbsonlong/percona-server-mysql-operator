@@ -123,7 +123,7 @@ func bootstrapGroupReplication() error {
 		if err != nil {
 			return errors.Wrap(err, "lookup")
 		}
-		log.Printf("peers: %v", peers.List())
+		log.Printf("peers: %v", sets.List(peers))
 
 		seeds, err = getGroupSeeds(peers)
 		if err != nil {
@@ -183,11 +183,11 @@ func bootstrapGroupReplication() error {
 	return nil
 }
 
-func getGroupSeeds(peers sets.String) ([]string, error) {
+func getGroupSeeds(peers sets.Set[string]) ([]string, error) {
 	seeds := sets.NewString()
 
 	if peers.Len() == 1 {
-		peer := peers.List()[0]
+		peer := sets.List(peers)[0]
 		log.Printf("there is only 1 peer: %s", peer)
 		seeds.Insert(fmt.Sprintf("%s:%d", peer, mysql.DefaultGRPort))
 		return seeds.List(), nil
@@ -205,7 +205,7 @@ func getGroupSeeds(peers sets.String) ([]string, error) {
 
 	// Find primary
 	var primary string
-	for _, peer := range peers.List() {
+	for _, peer := range sets.List(peers) {
 		if strings.HasPrefix(peer, podHostname) {
 			continue
 		}

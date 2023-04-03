@@ -35,7 +35,7 @@ func bootstrapAsyncReplication(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "lookup")
 	}
-	log.Printf("Peers: %v", peers.List())
+	log.Printf("Peers: %v", sets.List(peers))
 
 	exists, err := lockExists()
 	if err != nil {
@@ -189,12 +189,12 @@ func bootstrapAsyncReplication(ctx context.Context) error {
 	return nil
 }
 
-func getTopology(ctx context.Context, fqdn string, peers sets.String) (string, []string, error) {
+func getTopology(ctx context.Context, fqdn string, peers sets.Set[string]) (string, []string, error) {
 	operatorPass, err := getSecret(apiv1alpha1.UserOperator)
 	if err != nil {
 		return "", nil, errors.Wrapf(err, "get %s password", apiv1alpha1.UserOperator)
 	}
-	t, err := topology.GetAsync(ctx, operatorPass, peers.List()...)
+	t, err := topology.GetAsync(ctx, operatorPass, sets.List(peers)...)
 	if err != nil {
 		return "", nil, errors.Wrap(err, "failed to get topology")
 	}
