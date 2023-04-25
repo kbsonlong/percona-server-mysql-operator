@@ -113,6 +113,7 @@ func (r *PerconaServerMySQLReconciler) Reconcile(
 		return rr, r.applyFinalizers(ctx, cr)
 	}
 
+	// 调谐 Reconcile
 	if err := r.doReconcile(ctx, cr); err != nil {
 		return rr, errors.Wrap(err, "reconcile")
 	}
@@ -328,36 +329,47 @@ func (r *PerconaServerMySQLReconciler) doReconcile(
 ) error {
 	log := logf.FromContext(ctx).WithName("doReconcile")
 
+	// 版本检测、升级等
 	if err := r.reconcileVersions(ctx, cr); err != nil {
 		log.Error(err, "failed to reconcile versions")
 	}
+	// 如果 cr.SecretsName 存在则复制，不存在则生成随机密码
 	if err := r.ensureUserSecrets(ctx, cr); err != nil {
 		return errors.Wrap(err, "users secret")
 	}
+	// 根据 cr.SecretsName 生成 internal-{.cr.SecretsName} 的 secret
 	if err := r.reconcileUsers(ctx, cr); err != nil {
 		return errors.Wrap(err, "users")
 	}
+	// TLS 配置
 	if err := r.ensureTLSSecret(ctx, cr); err != nil {
 		return errors.Wrap(err, "TLS secret")
 	}
+	// Svc 创建
 	if err := r.reconcileServices(ctx, cr); err != nil {
 		return errors.Wrap(err, "services")
 	}
+	// 创建或更新 MySQL
 	if err := r.reconcileDatabase(ctx, cr); err != nil {
 		return errors.Wrap(err, "database")
 	}
+	// 创建或更新 Orchestrator 集群编排工具
 	if err := r.reconcileOrchestrator(ctx, cr); err != nil {
 		return errors.Wrap(err, "orchestrator")
 	}
+	// 配置 MySQL 集群
 	if err := r.reconcileReplication(ctx, cr); err != nil {
 		return errors.Wrap(err, "replication")
 	}
+	// 配置 HAProxy
 	if err := r.reconcileHAProxy(ctx, cr); err != nil {
 		return errors.Wrap(err, "HAProxy")
 	}
+	// 配置MySQL Router 服务
 	if err := r.reconcileMySQLRouter(ctx, cr); err != nil {
 		return errors.Wrap(err, "MySQL router")
 	}
+	// 清除集群
 	if err := r.cleanupOutdated(ctx, cr); err != nil {
 		return errors.Wrap(err, "cleanup outdated")
 	}
@@ -391,6 +403,7 @@ func (r *PerconaServerMySQLReconciler) reconcileDatabase(
 		return errors.Wrap(err, "reconcile MySQL config")
 	}
 
+	// 自动生成 MySQL 实例配置
 	if err = r.reconcileMySQLAutoConfig(ctx, cr); err != nil {
 		return errors.Wrap(err, "reconcile MySQL auto-config")
 	}
@@ -400,6 +413,7 @@ func (r *PerconaServerMySQLReconciler) reconcileDatabase(
 		return errors.Wrap(err, "get init image")
 	}
 
+	// 配置集群内部用户密码 secret
 	internalSecret := new(corev1.Secret)
 	nn := types.NamespacedName{Name: cr.InternalSecretName(), Namespace: cr.Namespace}
 	err = r.Client.Get(ctx, nn, internalSecret)
@@ -407,6 +421,7 @@ func (r *PerconaServerMySQLReconciler) reconcileDatabase(
 		return errors.Wrapf(err, "get Secret/%s", nn.Name)
 	}
 
+	// 创建或更新 MySQL 集群 StatefulSet 部署
 	if err := k8s.EnsureObjectWithHash(ctx, r.Client, cr, mysql.StatefulSet(cr, initImage, configHash, internalSecret), r.Scheme); err != nil {
 		return errors.Wrap(err, "reconcile sts")
 	}
@@ -508,6 +523,7 @@ func (r *PerconaServerMySQLReconciler) reconcileMySQLAutoConfig(ctx context.Cont
 
 		return nil
 	}
+	// 自动生成 MySQL 实例配置
 	autotuneParams, err := mysql.GetAutoTuneParams(cr, memory)
 	if err != nil {
 		return err

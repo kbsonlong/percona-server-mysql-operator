@@ -356,10 +356,10 @@ func HeadlessService(cr *apiv1alpha1.PerconaServerMySQL) *corev1.Service {
 			Labels:    labels,
 		},
 		Spec: corev1.ServiceSpec{
-			Type:      corev1.ServiceTypeClusterIP,
-			ClusterIP: "None",
-			Ports:     servicePorts(cr),
-			Selector:  labels,
+			Type:                     corev1.ServiceTypeClusterIP,
+			ClusterIP:                "None",
+			Ports:                    servicePorts(cr),
+			Selector:                 labels,
 			PublishNotReadyAddresses: cr.Spec.MySQL.IsGR(),
 		},
 	}
@@ -409,20 +409,26 @@ func PodService(cr *apiv1alpha1.PerconaServerMySQL, t corev1.ServiceType, podNam
 }
 
 func containers(cr *apiv1alpha1.PerconaServerMySQL, secret *corev1.Secret) []corev1.Container {
+	// MySQL container
 	containers := []corev1.Container{mysqldContainer(cr)}
 
+	// 启用备份, sidecar 注入
 	if backup := cr.Spec.Backup; backup != nil && backup.Enabled {
 		containers = append(containers, backupContainer(cr))
 	}
 
+	// debug工具, sidecar 注入
 	if toolkit := cr.Spec.Toolkit; toolkit != nil && cr.Spec.MySQL.IsAsync() && cr.OrchestratorEnabled() {
 		containers = append(containers, heartbeatContainer(cr))
 	}
 
+	// pmm监控, sidecar 注入
 	if cr.PMMEnabled(secret) {
 		containers = append(containers, pmmContainer(cr, secret))
 	}
 
+	// Operator 内置 container 和自定义 container 注入并排序确定唯一
+	// Operator 内置 container 不可替换
 	return appendUniqueContainers(containers, cr.Spec.MySQL.Sidecars...)
 }
 
@@ -759,6 +765,7 @@ func appendUniqueContainers(containers []corev1.Container, more ...corev1.Contai
 
 	for i := range more {
 		name := more[i].Name
+		// 当 container 同名的存在跳过，所以自定义 container 容器名称要避免与 operator 内置的 container 冲突
 		if exists[name] {
 			continue
 		}
